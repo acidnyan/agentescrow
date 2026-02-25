@@ -9,8 +9,11 @@ type Job = {
   token: 'USDC' | 'USDT';
   dueAt: string;
   creator: string;
+  payoutTo: string;
   assignee?: string;
   submitUrl?: string;
+  paymentUrl?: string;
+  paymentStatus?: 'pending' | 'opened' | 'confirmed';
   status: Status;
 };
 
@@ -29,6 +32,22 @@ button{background:#0f1320;color:var(--fg);border:1px solid #273142;border-radius
 `;
 
 function uid() { return `job_${Date.now().toString(36)}`; }
+function isAddress(v: string) { return /^0x[0-9a-fA-F]{40}$/.test(v); }
+function buildAgentPayLink(j: Job) {
+  const base = 'https://acidnyan.github.io/agentpay/';
+  const token = j.token.toLowerCase();
+  const memo = `escrow:${j.id}`;
+  const u = new URL(base);
+  u.searchParams.set('tab', 'pay');
+  u.searchParams.set('chain', j.chain);
+  u.searchParams.set('token', token);
+  u.searchParams.set('lock', '1');
+  u.searchParams.set('to', j.payoutTo);
+  u.searchParams.set('amount', j.reward);
+  u.searchParams.set('memo', memo);
+  u.searchParams.set('invoiceId', j.id);
+  return u.toString();
+}
 
 function save() { localStorage.setItem('agentescrow_mvp_jobs', JSON.stringify(state.jobs)); }
 function load() {
@@ -64,6 +83,9 @@ function appHtml() {
           <div class="col"><select id="token"><option>USDC</option><option>USDT</option></select></div>
           <div class="col"><input id="dueAt" type="datetime-local"/></div>
         </div>
+        <div class="row" style="margin-top:8px">
+          <div class="col"><input id="payoutTo" placeholder="Payout address (0x...)"/></div>
+        </div>
         <div style="margin-top:8px"><textarea id="desc" rows="3" placeholder="Description"></textarea></div>
         <div style="margin-top:8px"><button id="create" class="primary">Create</button></div>
       </div>
@@ -96,8 +118,10 @@ function appHtml() {
 function renderJobActions(j: Job) {
   return `<div class="card"><b>${j.title}</b> <span class="pill">${j.status}</span>
   <div class="small">${j.reward} ${j.token} on ${j.chain}</div>
+  <div class="small">payout to: ${j.payoutTo}</div>
   ${j.status === 'in_progress' && j.assignee === me ? `<div class="row" style="margin-top:8px"><input id="sub_${j.id}" placeholder="Deliverable URL"/><button data-submit="${j.id}">Submit</button></div>` : ''}
-  ${j.status === 'submitted' && j.creator === me ? `<div class="small">deliverable: ${j.submitUrl || '-'}</div><button data-approve="${j.id}" style="margin-top:8px">Approve & Pay</button>` : ''}
+  ${j.status === 'submitted' && j.creator === me ? `<div class="small">deliverable: ${j.submitUrl || '-'}</div><button data-approve="${j.id}" style="margin-top:8px">Approve & Create Payment Link</button>` : ''}
+  ${j.status === 'completed' && j.paymentUrl ? `<div class="small">payment: ${j.paymentStatus || 'pending'}</div><div class="row" style="margin-top:8px"><a class="small" href="${j.paymentUrl}" target="_blank" rel="noreferrer">Open AgentPay link</a><button data-paid="${j.id}">Mark paid</button></div>` : ''}
   </div>`;
 }
 
@@ -111,8 +135,10 @@ function bind() {
     const chain = (document.getElementById('chain') as HTMLSelectElement).value as 'base' | 'eth';
     const token = (document.getElementById('token') as HTMLSelectElement).value as 'USDC' | 'USDT';
     const dueAt = (document.getElementById('dueAt') as HTMLInputElement).value;
-    if (!title || !description || !reward || !dueAt) return;
-    state.jobs.unshift({ id: uid(), title, description, reward, chain, token, dueAt, creator: me, status: 'open' });
+    const payoutTo = (document.getElementById('payoutTo') as HTMLInputElement).value.trim();
+    if (!title || !description || !reward || !dueAt || !payoutTo) return;
+    if (!isAddress(payoutTo)) { alert('Invalid payout address'); return; }
+    state.jobs.unshift({ id: uid(), title, description, reward, chain, token, dueAt, payoutTo, creator: me, status: 'open' });
     save(); render();
   };
 
@@ -127,7 +153,18 @@ function bind() {
   });
   document.querySelectorAll<HTMLButtonElement>('[data-approve]').forEach(b => b.onclick = () => {
     const j = state.jobs.find(x => x.id === b.dataset.approve); if (!j) return;
-    j.status = 'completed'; save(); render();
+    j.paymentUrl = buildAgentPayLink(j);
+    j.paymentStatus = 'opened';
+    j.status = 'completed';
+    save();
+    render();
+    window.open(j.paymentUrl, '_blank', 'noreferrer');
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-paid]').forEach(b => b.onclick = () => {
+    const j = state.jobs.find(x => x.id === b.dataset.paid); if (!j) return;
+    j.paymentStatus = 'confirmed';
+    save();
+    render();
   });
 }
 
