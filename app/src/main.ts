@@ -13,6 +13,7 @@ type Job = {
   assignee?: string;
   submitUrl?: string;
   paymentUrl?: string;
+  paymentTxHash?: string;
   paymentStatus?: 'pending' | 'opened' | 'confirmed';
   status: Status;
 };
@@ -31,8 +32,33 @@ body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,sys
 button{background:#0f1320;color:var(--fg);border:1px solid #273142;border-radius:10px;padding:8px 10px;cursor:pointer} .primary{border-color:rgba(94,234,212,.45)} .small{font-size:12px;color:var(--muted)} .pill{padding:3px 8px;border:1px solid #273142;border-radius:999px}
 `;
 
+const TOKEN_ADDRESS = {
+  base: {
+    USDC: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    USDT: '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2',
+  },
+  eth: {
+    USDC: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+    USDT: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+  },
+} as const;
+
+const RPC_URL = {
+  base: 'https://mainnet.base.org',
+  eth: 'https://ethereum-rpc.publicnode.com',
+} as const;
+
 function uid() { return `job_${Date.now().toString(36)}`; }
 function isAddress(v: string) { return /^0x[0-9a-fA-F]{40}$/.test(v); }
+function isTxHash(v: string) { return /^0x[0-9a-fA-F]{64}$/.test(v); }
+function toUnits6(amount: string): bigint | null {
+  const s = amount.trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) return null;
+  const [i, f = ''] = s.split('.');
+  if (f.length > 6) return null;
+  return BigInt(i) * 1000000n + BigInt((f + '000000').slice(0, 6));
+}
+
 function buildAgentPayLink(j: Job) {
   const base = 'https://acidnyan.github.io/agentpay/';
   const token = j.token.toLowerCase();
@@ -121,7 +147,7 @@ function renderJobActions(j: Job) {
   <div class="small">payout to: ${j.payoutTo}</div>
   ${j.status === 'in_progress' && j.assignee === me ? `<div class="row" style="margin-top:8px"><input id="sub_${j.id}" placeholder="Deliverable URL"/><button data-submit="${j.id}">Submit</button></div>` : ''}
   ${j.status === 'submitted' && j.creator === me ? `<div class="small">deliverable: ${j.submitUrl || '-'}</div><button data-approve="${j.id}" style="margin-top:8px">Approve & Create Payment Link</button>` : ''}
-  ${j.status === 'completed' && j.paymentUrl ? `<div class="small">payment: ${j.paymentStatus || 'pending'}</div><div class="row" style="margin-top:8px"><a class="small" href="${j.paymentUrl}" target="_blank" rel="noreferrer">Open AgentPay link</a><button data-paid="${j.id}">Mark paid</button></div>` : ''}
+  ${j.status === 'completed' && j.paymentUrl ? `<div class="small">payment: ${j.paymentStatus || 'pending'}</div><div class="row" style="margin-top:8px"><a class="small" href="${j.paymentUrl}" target="_blank" rel="noreferrer">Open AgentPay link</a></div><div class="row" style="margin-top:8px"><input id="tx_${j.id}" placeholder="Tx hash (0x...)" value="${j.paymentTxHash || ''}"/><button data-verify="${j.id}">Verify tx</button></div>` : ''}
   </div>`;
 }
 
@@ -160,11 +186,53 @@ function bind() {
     render();
     window.open(j.paymentUrl, '_blank', 'noreferrer');
   });
-  document.querySelectorAll<HTMLButtonElement>('[data-paid]').forEach(b => b.onclick = () => {
-    const j = state.jobs.find(x => x.id === b.dataset.paid); if (!j) return;
-    j.paymentStatus = 'confirmed';
-    save();
-    render();
+  document.querySelectorAll<HTMLButtonElement>('[data-verify]').forEach(b => b.onclick = async () => {
+    const j = state.jobs.find(x => x.id === b.dataset.verify); if (!j) return;
+    const tx = (document.getElementById(`tx_${j.id}`) as HTMLInputElement)?.value?.trim() || '';
+    if (!isTxHash(tx)) { alert('Invalid tx hash'); return; }
+
+    const expectedTo = j.payoutTo.toLowerCase();
+    const expectedAmount = toUnits6(j.reward);
+    if (expectedAmount === null) { alert('Invalid reward amount'); return; }
+
+    const body = { jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt', params: [tx] };
+    try {
+      const res = await fetch(RPC_URL[j.chain], {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const json = await res.json();
+      const rcpt = json?.result;
+      if (!rcpt) { alert('Receipt not found yet'); return; }
+      if (rcpt.status !== '0x1') { alert('Transaction failed'); return; }
+
+      const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+      const tokenAddr = TOKEN_ADDRESS[j.chain][j.token].toLowerCase();
+      let matched = false;
+      for (const l of (rcpt.logs || [])) {
+        if ((l?.address || '').toLowerCase() !== tokenAddr) continue;
+        const topics = l?.topics || [];
+        if ((topics[0] || '').toLowerCase() !== transferTopic) continue;
+        const toAddr = `0x${String(topics[2] || '').toLowerCase().slice(-40)}`;
+        let value = 0n;
+        try { value = BigInt(l.data || '0x0'); } catch {}
+        if (toAddr === expectedTo && value === expectedAmount) { matched = true; break; }
+      }
+
+      if (!matched) {
+        alert('Transfer log mismatch (token/to/amount)');
+        return;
+      }
+
+      j.paymentTxHash = tx;
+      j.paymentStatus = 'confirmed';
+      save();
+      render();
+      alert('Payment verified and marked confirmed');
+    } catch (e: any) {
+      alert(e?.message || String(e));
+    }
   });
 }
 
